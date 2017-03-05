@@ -1,0 +1,262 @@
+diff -r c674dade719f Objects/listobject.c
+--- a/Objects/listobject.c	Sat Nov 12 22:48:50 2016 +0200
++++ b/Objects/listobject.c	Sat Nov 12 22:31:41 2016 -0700
+@@ -1033,17 +1033,244 @@
+         slice->values += n;
+ }
+ 
+-/* Comparison function: PyObject_RichCompareBool with Py_LT.
+- * Returns -1 on error, 1 if x < y, 0 if x >= y.
++/* Comparison function: selected at runtime based on the key type(s).
++ * All comparison functions return -1 on error, 1 if x < y, 0 if x >= y.
++ * Special-case functions work iff. the assertions they specify are met.
++ * Assertions are verified ahead-of-time in assign_compare_function (below).
+  */
+-
+-#define ISLT(X, Y) (PyObject_RichCompareBool(X, Y, Py_LT))
++#define Py_ABS(x) ((x) < 0 ? -(x) : (x))
++
++/* Safe compare for when none of the special cases apply. */
++static int
++safe_object_compare(PyObject* v, PyObject* w) {
++    return PyObject_RichCompareBool(v, w, Py_LT);
++}
++
++/* General unsafe compare: works on any two compareable objects of the same type.
++ * richcompare_function is set at runtime in assign_compare_function.
++ */
++static PyObject* (*richcompare_function)(PyObject* v, PyObject* w, int op);
++static int
++unsafe_object_compare(PyObject* v, PyObject* w){
++#ifdef Py_DEBUG
++    assert(v->ob_type->tp_richcompare == richcompare_function &&
++           w->ob_type->tp_richcompare == richcompare_function);
++#endif
++
++    PyObject* res = (*richcompare_function)(v, w, Py_LT);
++    if (res == NULL)
++        return -1;
++    int ok;
++    if (PyBool_Check(res)){
++        ok = (res == Py_True);
++    }
++    else {
++        ok = PyObject_IsTrue(res);
++    }
++    Py_DECREF(res);
++    return ok;
++}
++
++/* Unsafely compare two latin strings.
++ * We verify ahead of time that they are single-byte.
++ */
++static int
++unsafe_unicode_compare(PyObject* v, PyObject* w){
++#ifdef Py_DEBUG
++    assert(v->ob_type == &PyUnicode_Type && w->ob_type == &PyUnicode_Type &&
++           PyUnicode_KIND(v) == PyUnicode_1BYTE_KIND &&
++           PyUnicode_KIND(w) == PyUnicode_1BYTE_KIND);
++#endif
++
++    int len = Py_MIN(PyUnicode_GET_LENGTH(v), PyUnicode_GET_LENGTH(w));
++    int res = memcmp(PyUnicode_DATA(v), PyUnicode_DATA(w), len);
++
++    return (res != 0 ?
++            res < 0 :
++            PyUnicode_GET_LENGTH(v) < PyUnicode_GET_LENGTH(w));
++}
++
++/* Unsafely compare two "small" longs.
++ * We verify ahead of time that they fit in single sdigits.
++ */
++static int
++unsafe_long_compare(PyObject *v, PyObject *w)
++{
++#ifdef Py_DEBUG
++    assert(v->ob_type == &PyLong_Type && w->ob_type == &PyLong_Type &&
++           Py_ABS(Py_SIZE(v)) <= 1 && Py_ABS(Py_SIZE(w)) <= 1);
++#endif
++
++    PyLongObject *vl, *wl;
++    vl = (PyLongObject*)v;
++    wl = (PyLongObject*)w;
++
++    sdigit v0 = Py_SIZE(vl) == 0 ? 0 : (sdigit)vl->ob_digit[0];
++    sdigit w0 = Py_SIZE(wl) == 0 ? 0 : (sdigit)wl->ob_digit[0];
++
++    if (Py_SIZE(vl) < 0)
++        v0 = -v0;
++    if (Py_SIZE(wl) < 0)
++        w0 = -w0;
++
++    return v0 < w0;
++}
++
++/* Unsafely compare two floats.
++ * No caveats!
++ */
++static int
++unsafe_float_compare(PyObject *v, PyObject *w)
++{
++#ifdef Py_DEBUG
++    assert(v->ob_type == &PyFloat_Type && w->ob_type == &PyFloat_Type);
++#endif
++
++    return PyFloat_AS_DOUBLE(v) < PyFloat_AS_DOUBLE(w);
++}
++
++/* Unsafely compare two tuples.
++ * tuple_elem_compare efficiently compares the first elements of the tuples;
++ * it is assigned at runtime by assign_compare_function.
++ */
++
++static int (*tuple_elem_compare)(PyObject* v, PyObject* w);
++static int
++unsafe_tuple_compare(PyObject* v, PyObject* w)
++{
++#ifdef Py_DEBUG
++    assert(v->ob_type == &PyTuple_Type && w->ob_type == &PyTuple_Type &&
++           Py_SIZE(v) > 0 && Py_SIZE(w) > 0);
++#endif
++
++    PyTupleObject *vt, *wt;
++    Py_ssize_t i;
++    Py_ssize_t vlen, wlen;
++
++    vt = (PyTupleObject *)v;
++    wt = (PyTupleObject *)w;
++
++    int k = (*tuple_elem_compare)(vt->ob_item[0], wt->ob_item[0]);
++    if (k < 0)
++        return -1;
++    if (k)
++        return 1;
++
++    vlen = Py_SIZE(vt);
++    wlen = Py_SIZE(wt);
++
++    if (vlen == 1 || wlen == 1)
++        return 0;
++
++    k = (*tuple_elem_compare)(wt->ob_item[0], vt->ob_item[0]);
++    if (k < 0)
++        return -1;
++    if (k)
++        return 0;
++
++    for (i = 0; i < vlen && i < wlen; i++) {
++        k = PyObject_RichCompareBool(vt->ob_item[i],
++                                     wt->ob_item[i],
++                                     Py_EQ);
++        if (k < 0)
++            return -1;
++        if (!k)
++            break;
++    }
++
++    if (i >= vlen || i >= wlen){
++        return vlen <  wlen;
++    }
++
++    return PyObject_RichCompareBool(vt->ob_item[i],
++                                    wt->ob_item[i],
++                                    Py_LT);
++}
++
++/* Key compare function, set by assign_compare_function. */
++static int (*compare_function)(PyObject* v, PyObject* w);
++
++/* Checks various properties of the keys and picks the appropriate compare. */
++Py_LOCAL_INLINE(void)
++assign_compare_function(PyObject** keys, int len) {
++
++    /* Is there anything to compare? */
++    if (len < 2) return;
++
++    /* Assume the first element is representative of the whole list. */
++    int keys_are_in_tuples = (keys[0]->ob_type == &PyTuple_Type &&
++                              Py_SIZE(keys[0]) > 0);
++
++    PyTypeObject* key_type = (keys_are_in_tuples ?
++                              PyTuple_GET_ITEM(keys[0],0)->ob_type :
++                              keys[0]->ob_type);
++
++    int keys_are_all_same_type = 1;
++    int strings_are_latin = 1;
++    int ints_are_bounded = 1;
++
++    /* Prove that assumption by checking every key. */
++    int i;
++    for (i=0; i< len; i++) {
++
++        if (keys_are_in_tuples &&
++            (keys[i]->ob_type != &PyTuple_Type || Py_SIZE(keys[i]) == 0)){
++            keys_are_in_tuples = 0;
++            keys_are_all_same_type = 0;
++            break;
++        }
++
++        PyObject* key = (keys_are_in_tuples ?
++                         PyTuple_GET_ITEM(keys[i],0) :
++                         keys[i]);
++
++        if (key->ob_type != key_type) {
++            keys_are_all_same_type = 0;
++            break;
++        }
++
++        else if (key_type == &PyLong_Type && ints_are_bounded &&
++                 Py_ABS(Py_SIZE(key)) > 1)
++            ints_are_bounded = 0;
++
++        else if (key_type == &PyUnicode_Type && strings_are_latin &&
++                 PyUnicode_KIND(key) != PyUnicode_1BYTE_KIND)
++            strings_are_latin = 0;
++    }
++
++    /* Choose the best compare, given what we now know about the keys. */
++    if (keys_are_all_same_type) {
++
++        if (key_type == &PyUnicode_Type && strings_are_latin)
++            compare_function = unsafe_unicode_compare;
++
++        else if (key_type == &PyLong_Type && ints_are_bounded)
++            compare_function = unsafe_long_compare;
++
++        else if (key_type == &PyFloat_Type)
++            compare_function = unsafe_float_compare;
++
++        else if ((richcompare_function = key_type->tp_richcompare) != NULL)
++            compare_function = unsafe_object_compare;
++
++    } else {
++        compare_function = safe_object_compare;
++    }
++
++    if (keys_are_in_tuples) {
++        tuple_elem_compare = compare_function;
++        compare_function = unsafe_tuple_compare;
++    }
++}
++#undef Py_ABS
++
++#define ISLT(X, Y) ((*compare_function)(X, Y))
+ 
+ /* Compare X to Y via "<".  Goto "fail" if the comparison raises an
+    error.  Else "k" is set to true iff X<Y, and an "if (k)" block is
+    started.  It makes more sense in context <wink>.  X and Y are PyObject*s.
+ */
+-#define IFLT(X, Y) if ((k = ISLT(X, Y)) < 0) goto fail;  \
++#define IFLT(X, Y) if ((k = ISLT(X, Y)) < 0) goto fail; \
+            if (k)
+ 
+ /* binarysort is the best method for sorting small arrays: it does
+@@ -1985,6 +2212,8 @@
+         lo.values = saved_ob_item;
+     }
+ 
++    assign_compare_function(lo.keys, saved_ob_size);
++
+     merge_init(&ms, saved_ob_size, keys != NULL);
+ 
+     nremaining = saved_ob_size;

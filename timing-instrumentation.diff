@@ -1,0 +1,42 @@
+diff --git a/Objects/listobject.c b/Objects/listobject.c
+--- a/Objects/listobject.c
++++ b/Objects/listobject.c
+@@ -2085,7 +2085,37 @@
+     if (!PyArg_ParseTupleAndKeywords(args, kwds, "|$Oi:sort",
+         kwlist, &keyfunc, &reverse))
+         return NULL;
+-    return listsort_impl(self, keyfunc, reverse);
++
++    /* TIMING */
++    unsigned start_low, start_high, end_low, end_high;
++
++    __asm__ __volatile__
++      (
++       "CPUID\n\t"/*serialize*/
++       "RDTSC\n\t"/*read the clock*/
++       "mov %%edx, %0\n\t"
++       "mov %%eax, %1\n\t": "=r" (start_high), "=r"
++       (start_low):: "%rax", "%rbx", "%rcx", "%rdx"
++      );
++
++    PyObject* res = listsort_impl(self, keyfunc, reverse);
++
++    __asm__ __volatile__
++      (
++       "RDTSCP\n\t"/*read the clock*/
++       "mov %%edx, %0\n\t"
++       "mov %%eax, %1\n\t"
++       "CPUID\n\t": "=r" (end_high), "=r"
++       (end_low):: "%rax", "%rbx", "%rcx", "%rdx"
++      );
++
++    uint64_t time = (((uint64_t)end_high << 32) | end_low) - 
++                    (((uint64_t)start_high << 32) | start_low);
++
++    printf("SORT TIME: %lu\n",time);
++    /* TIMING */
++    
++    return res;
+ }
+ 
+ int
