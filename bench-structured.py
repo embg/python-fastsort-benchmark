@@ -1,11 +1,6 @@
 #These functions construct the different types of lists we will benchmark
 funcs = []
 
-def star_sort(n):
-    random.seed(n)
-    return [random.randint(-2**31,2**31) for _ in range(n)]
-funcs.append(('*sort',star_sort))
-
 def backslash_sort(n):
     L = list(range(n))
     L.reverse()
@@ -50,7 +45,7 @@ funcs.append(('~sort',tilde_sort))
 def equal_sort(n):
     return [0]*n
 funcs.append(('=sort',equal_sort))
-    
+
 #This is the main benchmark loop
 
 #stdout_redirector from:
@@ -59,24 +54,30 @@ from stdout_redirector import stdout_redirector
 import io, random, re
 
 def run_benchmark(iterations,start_size,step,end_size):
-    times = {label:[]for (label,func) in funcs};
-
+    homogeneous_times = {label:[] for (label,func) in funcs};
+    heterogeneous_times = {label:[] for (label,func) in funcs};
+    
     print("Benchmark started")
     
     for iteration in range(iterations):
         print("{}%".format(100*iteration/iterations))
         for (label,func) in funcs:
-            total_time = 0
+            homogeneous_time = 0
+            heterogeneous_time = 0
             for n in range(start_size,end_size,step):
                 stdout_capture = io.BytesIO()
                 with stdout_redirector(stdout_capture):
                     func(n).sort()
-                (time,) = re.match('TOT (\d+)',
-                                stdout_capture.getvalue().\
-                                decode('utf-8')).groups()
-                total_time += int(time)
-            times[label].append(total_time)
-                
+                    (func(n)+[0.0]).sort()
+                (homogeneous,
+                 heterogeneous) = re.match('SORT TIME: (\d+)\nSORT TIME: (\d+)', 
+                                           stdout_capture.getvalue().\
+                                           decode('utf-8')).groups()
+                homogeneous_time += int(homogeneous)
+                heterogeneous_time += int(heterogeneous)
+            homogeneous_times[label].append(homogeneous_time)
+            heterogeneous_times[label].append(heterogeneous_time)
+                            
     print("Benchmark ended")
     return times
 
